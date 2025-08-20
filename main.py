@@ -6,7 +6,6 @@ import yfinance as yf
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor
 
-# Indicadores de ta (100% Python, no ta-lib)
 from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator
 from ta.volatility import AverageTrueRange
@@ -16,6 +15,12 @@ TOKEN = os.environ.get("BOT_TOKEN")
 BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
 DB_PATH = "po_bot.db"
 EXEC = ThreadPoolExecutor(max_workers=4)
+
+# Lista de pares soportados
+AVAILABLE_PAIRS = [
+    "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD",
+    "USDCHF", "NZDUSD", "EURGBP", "EURJPY", "GBPJPY"
+]
 
 app = Flask(__name__)
 
@@ -152,7 +157,7 @@ def webhook():
         text = (update["message"].get("text") or "").strip()
 
         if text.startswith("/start"):
-            send_message(chat_id, "👋 Bienvenido! Usa /config <balance> <riesgo%> y /signal <par>")
+            send_message(chat_id, "👋 Bienvenido! Usa /config <balance> <riesgo%> y /signal <par>.\n\nDisponibles: " + ", ".join(AVAILABLE_PAIRS))
             return "ok", 200
 
         elif text.startswith("/config"):
@@ -172,11 +177,36 @@ def webhook():
             parts = text.split()
             if len(parts) >= 2:
                 pair = parts[1].upper()
+                if pair not in AVAILABLE_PAIRS:
+                    send_message(chat_id, "⚠️ Par no soportado. Disponibles: " + ", ".join(AVAILABLE_PAIRS))
+                    return "ok", 200
                 user = get_user(chat_id)
                 send_message(chat_id, f"⏳ Analizando {pair}…")
                 EXEC.submit(handle_signal_async, chat_id, pair, user)
             else:
                 send_message(chat_id, "Formato: /signal EURUSD")
+            return "ok", 200
+
+        elif text.startswith("/signalall"):
+            user = get_user(chat_id)
+            send_message(chat_id, "⏳ Analizando todos los pares disponibles…")
+
+            results = []
+            for pair in AVAILABLE_PAIRS:
+                sig, note = analyze_pair(yahoo_symbol(pair))
+                if sig:  # solo mostramos señales positivas
+                    stake = round(user["balance"] * (user["risk_pct"] / 100.0), 2)
+                    icon = "🟢" if sig == "CALL" else "🔴"
+                    results.append(
+                        f"{icon} {pair}: {sig} | Stake: {stake:.2f}\n{note}"
+                    )
+
+            if results:
+                final_msg = "📊 <b>Señales encontradas</b>\n\n" + "\n\n".join(results)
+            else:
+                final_msg = "❌ No se encontraron señales claras en los pares disponibles."
+
+            send_message(chat_id, final_msg)
             return "ok", 200
 
     return "ok", 200
