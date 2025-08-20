@@ -22,17 +22,25 @@ AVAILABLE_PAIRS = [
     "USDCHF", "NZDUSD", "EURGBP", "EURJPY", "GBPJPY"
 ]
 
-# --------- UMBRALES (puedes afinarlos sin tocar la lógica) ----------
-RSI15_CALL_MAX = 38   # señal CALL si RSI15 <= 38 y en banda baja
-RSI15_PUT_MIN  = 62   # señal PUT  si RSI15 >= 62 y en banda alta
-RSI1_CONFIRM_CALL = 50  # confirmación M1 CALL: RSI1 >= 50
-RSI1_CONFIRM_PUT  = 50  # confirmación M1 PUT : RSI1 <= 50
+# --------- UMBRALES (ajustables sin tocar la lógica) ----------
+# 15m (setup principal)
 BB_WINDOW = 20
-BB_DEV = 2
+BB_DEV = 2.0
+# “Cerca de banda” (p.ej. 15% del ancho de bandas)
+BAND_TOL_FRAC = 0.15
+
+RSI15_CALL_MAX = 45   # más laxo (antes 38)
+RSI15_PUT_MIN  = 55   # más laxo (antes 62)
+
+# MACD 15m: permitimos cruce o pendiente a favor
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
-# -------------------------------------------------------------------
+
+# Confirmación en 1m (momentum a favor)
+RSI1_CONFIRM_CALL = 50   # suficiente que esté >= 50
+RSI1_CONFIRM_PUT  = 50   # suficiente que esté <= 50
+# ----------------------------------------------------------------
 
 app = Flask(__name__)
 
@@ -78,7 +86,7 @@ def tg(method, payload):
 def send_message(chat_id, text):
     return tg("sendMessage", {"chat_id": chat_id, "text": text, "parse_mode": "HTML"})
 
-# --- Utilidades / (dejanmos las funciones previas aunque no todas se usen) ---
+# --- Utilidades / (dejamos helpers previos aunque no todos se usen) ---
 def yahoo_symbol(pair: str) -> str:
     pair = pair.upper().replace(" ", "")
     return pair if pair.endswith("=X") else f"{pair}=X"
@@ -98,7 +106,7 @@ def is_engulfing_bull(po, pc, lo, lc) -> bool:
 def is_engulfing_bear(po, pc, lo, lc) -> bool:
     return (lc < lo) and (pc > po) and (lc <= min(po, pc)) and (lo >= max(po, pc))
 
-# --- Estrategia: Bollinger + RSI + MACD (M15) con confirmación en M1 ---
+# --- Estrategia: BB + RSI + MACD (15m) con confirmación en 1m ---
 def analyze_pair(symbol: str):
     try:
         # Más historial para MACD/BB en 15m
@@ -110,61 +118,83 @@ def analyze_pair(symbol: str):
         if m1 is None or m1.empty or len(m1) < 40:
             return None, "Datos 1m insuficientes"
 
+        m15 = m15.dropna()
+        m1  = m1.dropna()
+
         # ----- 15m (setup principal) -----
-        bb15 = BollingerBands(close=m15["Close"], window=BB_WINDOW, window_dev=BB_DEV)
+        close15 = m15["Close"]
+        bb15 = BollingerBands(close=close15, window=BB_WINDOW, window_dev=BB_DEV)
         lband15 = bb15.bollinger_lband()
         hband15 = bb15.bollinger_hband()
         basis15 = bb15.bollinger_mavg()
 
-        rsi15 = get_rsi(m15["Close"], 14)
-        macd15_ind = MACD(close=m15["Close"], window_slow=MACD_SLOW, window_fast=MACD_FAST, window_sign=MACD_SIGNAL)
-        macd15 = macd15_ind.macd()
-        macdsig15 = macd15_ind.macd_signal()
+        rsi15 = get_rsi(close15, 14)
 
-        c15 = float(m15["Close"].iloc[-1])
-        lb15 = float(lband15.iloc[-1]); ub15 = float(hband15.iloc[-1]); mb15 = float(basis15.iloc[-1])
-        r15 = float(rsi15.iloc[-1])
-        macd15_now = float(macd15.iloc[-1]); macd15_prev = float(macd15.iloc[-2])
-        sig15_now  = float(macdsig15.iloc[-1]); sig15_prev  = float(macdsig15.iloc[-2])
+        macd15_ind = MACD(close=close15, window_slow=MACD_SLOW, window_fast=MACD_FAST, window_sign=MACD_SIGNAL)
+        macd15     = macd15_ind.macd()
+        macdsig15  = macd15_ind.macd_signal()
+        hist15     = macd15_ind.macd_diff()
 
+        c15   = float(close15.iloc[-1])
+        lb15  = float(lband15.iloc[-1]); ub15 = float(hband15.iloc[-1]); mb15 = float(basis15.iloc[-1])
+        r15   = float(rsi15.iloc[-1])
+        h15   = float(hist15.iloc[-1]); h15_1 = float(hist15.iloc[-2])
+
+        # “Cerca de banda” con tolerancia
+        band_width = max(ub15 - lb15, 1e-10)
+        lower_thr  = lb15 + BAND_TOL_FRAC * band_width
+        upper_thr  = ub15 - BAND_TOL_FRAC * band_width
+
+        near_lower = (c15 <= lower_thr)
+        near_upper = (c15 >= upper_thr)
+
+        # MACD 15m: aceptamos cruce O pendiente a favor
+        macd15_now   = float(macd15.iloc[-1]); macd15_prev = float(macd15.iloc[-2])
+        sig15_now    = float(macdsig15.iloc[-1]); sig15_prev = float(macdsig15.iloc[-2])
         cross_up_15   = (macd15_now > sig15_now) and (macd15_prev <= sig15_prev)
         cross_down_15 = (macd15_now < sig15_now) and (macd15_prev >= sig15_prev)
+        slope_up_15   = (h15 > h15_1)
+        slope_dn_15   = (h15 < h15_1)
 
-        call_setup_15 = (c15 <= lb15) and (r15 <= RSI15_CALL_MAX) and cross_up_15
-        put_setup_15  = (c15 >= ub15) and (r15 >= RSI15_PUT_MIN) and cross_down_15
+        call_setup_15 = near_lower and (r15 <= RSI15_CALL_MAX) and (cross_up_15 or slope_up_15)
+        put_setup_15  = near_upper and (r15 >= RSI15_PUT_MIN)  and (cross_down_15 or slope_dn_15)
 
-        # Si no hay setup en 15m, no seguimos
         if not (call_setup_15 or put_setup_15):
             return None, "15m sin setup (BB/RSI/MACD)"
 
         # ----- 1m (confirmación) -----
-        bb1 = BollingerBands(close=m1["Close"], window=BB_WINDOW, window_dev=BB_DEV)
-        basis1 = float(bb1.bollinger_mavg().iloc[-1])
-        rsi1 = get_rsi(m1["Close"], 14)
-        macd1_ind = MACD(close=m1["Close"], window_slow=MACD_SLOW, window_fast=MACD_FAST, window_sign=MACD_SIGNAL)
-        macd1 = macd1_ind.macd(); macdsig1 = macd1_ind.macd_signal()
+        close1 = m1["Close"]
+        rsi1   = get_rsi(close1, 14)
+        macd1i = MACD(close=close1, window_slow=MACD_SLOW, window_fast=MACD_FAST, window_sign=MACD_SIGNAL)
+        macd1  = macd1i.macd()
+        sig1   = macd1i.macd_signal()
 
-        c1 = float(m1["Close"].iloc[-1])
+        c1 = float(close1.iloc[-1])
         r1 = float(rsi1.iloc[-1])
-        macd1_now = float(macd1.iloc[-1]); macdsig1_now = float(macdsig1.iloc[-1])
+        macd1_now = float(macd1.iloc[-1]); sig1_now = float(sig1.iloc[-1])
 
-        # Confirmaciones simples en 1m (momentum a favor)
+        # Confirmaciones razonables en 1m (momentum a favor)
         if call_setup_15:
-            confirm = (r1 >= RSI1_CONFIRM_CALL) and (macd1_now > macdsig1_now) and (c1 >= basis1)
+            confirm = (macd1_now > sig1_now) or (r1 >= RSI1_CONFIRM_CALL)
             if confirm:
-                note = (f"CALL: 15m cierre<=LB ({c15:.5f}<= {lb15:.5f}), RSI15={r15:.1f}≤{RSI15_CALL_MAX}, "
-                        f"MACD15 cruce↑; Confirmación 1m: RSI1={r1:.1f}≥{RSI1_CONFIRM_CALL}, MACD1>signal, Close≥Base")
+                note = (f"CALL: 15m cerca LB (c={c15:.5f}, LB*tol={lower_thr:.5f}), "
+                        f"RSI15={r15:.1f}≤{RSI15_CALL_MAX}, MACD15 {'cruce↑' if cross_up_15 else 'pendiente↑'}; "
+                        f"Conf 1m: {'MACD1>signal' if macd1_now>sig1_now else ''}"
+                        f"{' y ' if (macd1_now>sig1_now and r1>=RSI1_CONFIRM_CALL) else ''}"
+                        f"{'RSI1≥'+str(RSI1_CONFIRM_CALL) if r1>=RSI1_CONFIRM_CALL else ''}")
                 return "CALL", note
-            return None, "Setup CALL en 15m pero sin confirmación en 1m"
+            return None, "Setup CALL en 15m sin confirmación 1m"
 
         if put_setup_15:
-            confirm = (r1 <= RSI1_CONFIRM_PUT) and (macd1_now < macdsig1_now) and (c1 <= basis1)
+            confirm = (macd1_now < sig1_now) or (r1 <= RSI1_CONFIRM_PUT)
             if confirm:
-                note = (f"PUT: 15m cierre>=UB ({c15:.5f}≥ {ub15:.5f}), RSI15={r15:.1f}≥{RSI15_PUT_MIN}, "
-                        f"MACD15 cruce↓; Confirmación 1m: RSI1={r1:.1f}≤{RSI1_CONFIRM_PUT}, MACD1<signal, Close≤Base")
-            #   return
+                note = (f"PUT: 15m cerca UB (c={c15:.5f}, UB*tol={upper_thr:.5f}), "
+                        f"RSI15={r15:.1f}≥{RSI15_PUT_MIN}, MACD15 {'cruce↓' if cross_down_15 else 'pendiente↓'}; "
+                        f"Conf 1m: {'MACD1<signal' if macd1_now<sig1_now else ''}"
+                        f"{' y ' if (macd1_now<sig1_now and r1<=RSI1_CONFIRM_PUT) else ''}"
+                        f"{'RSI1≤'+str(RSI1_CONFIRM_PUT) if r1<=RSI1_CONFIRM_PUT else ''}")
                 return "PUT", note
-            return None, "Setup PUT en 15m pero sin confirmación en 1m"
+            return None, "Setup PUT en 15m sin confirmación 1m"
 
         return None, "Sin señal"
     except Exception as e:
@@ -206,7 +236,7 @@ def handle_signalall_async(chat_id, user):
     except Exception as e:
         send_message(chat_id, f"⚠️ Error en /signalall: {e}")
 
-# --- Rutas Flask (sin cambios) ---
+# --- Rutas Flask (igual) ---
 @app.route("/")
 def home():
     return "Bot vivo ✅"
