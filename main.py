@@ -4,7 +4,7 @@ import requests
 from flask import Flask, request
 import yfinance as yf
 import pandas as pd
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator
@@ -141,6 +141,31 @@ def handle_signal_async(chat_id, pair, user):
     except Exception as e:
         send_message(chat_id, f"⚠️ Error en /signal {pair}: {e}")
 
+# --- Async handler para /signalall ---
+def handle_signalall_async(chat_id, user):
+    try:
+        futures = {pair: EXEC.submit(analyze_pair, yahoo_symbol(pair)) for pair in AVAILABLE_PAIRS}
+
+        results = []
+        for pair, fut in futures.items():
+            try:
+                sig, note = fut.result(timeout=25)
+                if sig:  # solo mostramos señales positivas
+                    stake = round(user["balance"] * (user["risk_pct"] / 100.0), 2)
+                    icon = "🟢" if sig == "CALL" else "🔴"
+                    results.append(f"{icon} {pair}: {sig} | Stake: {stake:.2f}\n{note}")
+            except Exception:
+                pass
+
+        if results:
+            final_msg = "📊 <b>Señales encontradas</b>\n\n" + "\n\n".join(results)
+        else:
+            final_msg = "❌ No se encontraron señales claras en los pares disponibles."
+
+        send_message(chat_id, final_msg)
+    except Exception as e:
+        send_message(chat_id, f"⚠️ Error en /signalall: {e}")
+
 # --- Rutas Flask ---
 @app.route("/")
 def home():
@@ -190,23 +215,7 @@ def webhook():
         elif text.startswith("/signalall"):
             user = get_user(chat_id)
             send_message(chat_id, "⏳ Analizando todos los pares disponibles…")
-
-            results = []
-            for pair in AVAILABLE_PAIRS:
-                sig, note = analyze_pair(yahoo_symbol(pair))
-                if sig:  # solo mostramos señales positivas
-                    stake = round(user["balance"] * (user["risk_pct"] / 100.0), 2)
-                    icon = "🟢" if sig == "CALL" else "🔴"
-                    results.append(
-                        f"{icon} {pair}: {sig} | Stake: {stake:.2f}\n{note}"
-                    )
-
-            if results:
-                final_msg = "📊 <b>Señales encontradas</b>\n\n" + "\n\n".join(results)
-            else:
-                final_msg = "❌ No se encontraron señales claras en los pares disponibles."
-
-            send_message(chat_id, final_msg)
+            EXEC.submit(handle_signalall_async, chat_id, user)
             return "ok", 200
 
     return "ok", 200
