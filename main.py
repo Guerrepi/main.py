@@ -7,8 +7,8 @@ import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ta.momentum import RSIIndicator
-from ta.trend import EMAIndicator
-from ta.volatility import AverageTrueRange
+from ta.trend import EMAIndicator, MACD
+from ta.volatility import AverageTrueRange, BollingerBands
 
 # --- Configuración ---
 TOKEN = os.environ.get("BOT_TOKEN")
@@ -21,6 +21,18 @@ AVAILABLE_PAIRS = [
     "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD",
     "USDCHF", "NZDUSD", "EURGBP", "EURJPY", "GBPJPY"
 ]
+
+# --------- UMBRALES (puedes afinarlos sin tocar la lógica) ----------
+RSI15_CALL_MAX = 38   # señal CALL si RSI15 <= 38 y en banda baja
+RSI15_PUT_MIN  = 62   # señal PUT  si RSI15 >= 62 y en banda alta
+RSI1_CONFIRM_CALL = 50  # confirmación M1 CALL: RSI1 >= 50
+RSI1_CONFIRM_PUT  = 50  # confirmación M1 PUT : RSI1 <= 50
+BB_WINDOW = 20
+BB_DEV = 2
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
+# -------------------------------------------------------------------
 
 app = Flask(__name__)
 
@@ -66,7 +78,7 @@ def tg(method, payload):
 def send_message(chat_id, text):
     return tg("sendMessage", {"chat_id": chat_id, "text": text, "parse_mode": "HTML"})
 
-# --- Indicadores / utilidades ---
+# --- Utilidades / (dejanmos las funciones previas aunque no todas se usen) ---
 def yahoo_symbol(pair: str) -> str:
     pair = pair.upper().replace(" ", "")
     return pair if pair.endswith("=X") else f"{pair}=X"
@@ -86,43 +98,79 @@ def is_engulfing_bull(po, pc, lo, lc) -> bool:
 def is_engulfing_bear(po, pc, lo, lc) -> bool:
     return (lc < lo) and (pc > po) and (lc <= min(po, pc)) and (lo >= max(po, pc))
 
-# --- Estrategia ---
+# --- Estrategia: Bollinger + RSI + MACD (M15) con confirmación en M1 ---
 def analyze_pair(symbol: str):
     try:
-        m15 = yf.download(symbol, interval="15m", period="4d", progress=False)
+        # Más historial para MACD/BB en 15m
+        m15 = yf.download(symbol, interval="15m", period="5d", progress=False)
         m1  = yf.download(symbol, interval="1m",  period="1d", progress=False)
 
-        if m15 is None or m15.empty or len(m15) < 210:
-            return None, "Datos M15 insuficientes"
-        if m1 is None or m1.empty or len(m1) < 30:
-            return None, "Datos M1 insuficientes"
+        if m15 is None or m15.empty or len(m15) < 120:
+            return None, "Datos 15m insuficientes"
+        if m1 is None or m1.empty or len(m1) < 40:
+            return None, "Datos 1m insuficientes"
 
-        ema50  = get_ema(m15['Close'], 50)
-        ema200 = get_ema(m15['Close'], 200)
-        trend = "up" if float(ema50.iloc[-1]) > float(ema200.iloc[-1]) else "down"
+        # ----- 15m (setup principal) -----
+        bb15 = BollingerBands(close=m15["Close"], window=BB_WINDOW, window_dev=BB_DEV)
+        lband15 = bb15.bollinger_lband()
+        hband15 = bb15.bollinger_hband()
+        basis15 = bb15.bollinger_mavg()
 
-        rsi = get_rsi(m1['Close'], 14)
-        atr = get_atr(m1['High'], m1['Low'], m1['Close'], 14)
-        last_rsi = float(rsi.iloc[-1])
-        last_atr = float(atr.iloc[-1]); avg_atr = float(atr.iloc[-20:].mean())
+        rsi15 = get_rsi(m15["Close"], 14)
+        macd15_ind = MACD(close=m15["Close"], window_slow=MACD_SLOW, window_fast=MACD_FAST, window_sign=MACD_SIGNAL)
+        macd15 = macd15_ind.macd()
+        macdsig15 = macd15_ind.macd_signal()
 
-        last = m1.iloc[-1]; prev = m1.iloc[-2]
-        bull = is_engulfing_bull(prev['Open'], prev['Close'], last['Open'], last['Close'])
-        bear = is_engulfing_bear(prev['Open'], prev['Close'], last['Open'], last['Close'])
+        c15 = float(m15["Close"].iloc[-1])
+        lb15 = float(lband15.iloc[-1]); ub15 = float(hband15.iloc[-1]); mb15 = float(basis15.iloc[-1])
+        r15 = float(rsi15.iloc[-1])
+        macd15_now = float(macd15.iloc[-1]); macd15_prev = float(macd15.iloc[-2])
+        sig15_now  = float(macdsig15.iloc[-1]); sig15_prev  = float(macdsig15.iloc[-2])
 
-        if last_atr <= avg_atr:
-            return None, "ATR bajo (poca volatilidad)"
+        cross_up_15   = (macd15_now > sig15_now) and (macd15_prev <= sig15_prev)
+        cross_down_15 = (macd15_now < sig15_now) and (macd15_prev >= sig15_prev)
 
-        if trend == "up" and last_rsi < 30 and bull:
-            return "CALL", "RSI < 30 + Tendencia alcista + Engulfing alcista"
-        if trend == "down" and last_rsi > 70 and bear:
-            return "PUT",  "RSI > 70 + Tendencia bajista + Engulfing bajista"
+        call_setup_15 = (c15 <= lb15) and (r15 <= RSI15_CALL_MAX) and cross_up_15
+        put_setup_15  = (c15 >= ub15) and (r15 >= RSI15_PUT_MIN) and cross_down_15
 
-        return None, "No cumple condiciones"
+        # Si no hay setup en 15m, no seguimos
+        if not (call_setup_15 or put_setup_15):
+            return None, "15m sin setup (BB/RSI/MACD)"
+
+        # ----- 1m (confirmación) -----
+        bb1 = BollingerBands(close=m1["Close"], window=BB_WINDOW, window_dev=BB_DEV)
+        basis1 = float(bb1.bollinger_mavg().iloc[-1])
+        rsi1 = get_rsi(m1["Close"], 14)
+        macd1_ind = MACD(close=m1["Close"], window_slow=MACD_SLOW, window_fast=MACD_FAST, window_sign=MACD_SIGNAL)
+        macd1 = macd1_ind.macd(); macdsig1 = macd1_ind.macd_signal()
+
+        c1 = float(m1["Close"].iloc[-1])
+        r1 = float(rsi1.iloc[-1])
+        macd1_now = float(macd1.iloc[-1]); macdsig1_now = float(macdsig1.iloc[-1])
+
+        # Confirmaciones simples en 1m (momentum a favor)
+        if call_setup_15:
+            confirm = (r1 >= RSI1_CONFIRM_CALL) and (macd1_now > macdsig1_now) and (c1 >= basis1)
+            if confirm:
+                note = (f"CALL: 15m cierre<=LB ({c15:.5f}<= {lb15:.5f}), RSI15={r15:.1f}≤{RSI15_CALL_MAX}, "
+                        f"MACD15 cruce↑; Confirmación 1m: RSI1={r1:.1f}≥{RSI1_CONFIRM_CALL}, MACD1>signal, Close≥Base")
+                return "CALL", note
+            return None, "Setup CALL en 15m pero sin confirmación en 1m"
+
+        if put_setup_15:
+            confirm = (r1 <= RSI1_CONFIRM_PUT) and (macd1_now < macdsig1_now) and (c1 <= basis1)
+            if confirm:
+                note = (f"PUT: 15m cierre>=UB ({c15:.5f}≥ {ub15:.5f}), RSI15={r15:.1f}≥{RSI15_PUT_MIN}, "
+                        f"MACD15 cruce↓; Confirmación 1m: RSI1={r1:.1f}≤{RSI1_CONFIRM_PUT}, MACD1<signal, Close≤Base")
+            #   return
+                return "PUT", note
+            return None, "Setup PUT en 15m pero sin confirmación en 1m"
+
+        return None, "Sin señal"
     except Exception as e:
         return None, f"Error: {e}"
 
-# --- Async handlers ---
+# --- Async handlers (igual que ya tenías) ---
 def handle_signal_async(chat_id, pair, user):
     try:
         sig, note = analyze_pair(yahoo_symbol(pair))
@@ -158,7 +206,7 @@ def handle_signalall_async(chat_id, user):
     except Exception as e:
         send_message(chat_id, f"⚠️ Error en /signalall: {e}")
 
-# --- Rutas Flask ---
+# --- Rutas Flask (sin cambios) ---
 @app.route("/")
 def home():
     return "Bot vivo ✅"
@@ -190,7 +238,6 @@ def webhook():
                 send_message(chat_id, "Formato inválido. Ej: /config 200 1.5")
             return "ok", 200
 
-        # --- IMPORTANTE: /signalall ANTES que /signal ---
         elif text.startswith("/signalall"):
             user = get_user(chat_id)
             send_message(chat_id, "⏳ Analizando todos los pares disponibles…")
